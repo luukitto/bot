@@ -7,6 +7,16 @@ except ModuleNotFoundError:
 
 from config import DATABASE_URL, DB_PATH
 
+CRM_USER_COLUMNS = {
+    "full_name": "TEXT",
+    "email": "TEXT",
+    "phone": "TEXT",
+    "country": "TEXT",
+    "status": "TEXT DEFAULT 'active'",
+    "admin_notes": "TEXT",
+    "updated_at": "TIMESTAMPTZ",
+}
+
 
 def use_postgres() -> bool:
     return bool(DATABASE_URL)
@@ -22,6 +32,26 @@ async def connect_postgres():
     return await asyncpg.connect(DATABASE_URL, statement_cache_size=0)
 
 
+async def ensure_postgres_crm_columns(conn):
+    for column, column_type in CRM_USER_COLUMNS.items():
+        await conn.execute(
+            f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {column} {column_type}"
+        )
+
+
+async def ensure_sqlite_crm_columns(db):
+    cursor = await db.execute("PRAGMA table_info(users)")
+    existing_columns = {row[1] for row in await cursor.fetchall()}
+    sqlite_columns = {
+        **CRM_USER_COLUMNS,
+        "updated_at": "TEXT",
+    }
+
+    for column, column_type in sqlite_columns.items():
+        if column not in existing_columns:
+            await db.execute(f"ALTER TABLE users ADD COLUMN {column} {column_type}")
+
+
 async def init_db():
     if use_postgres():
         conn = await connect_postgres()
@@ -32,9 +62,17 @@ async def init_db():
                     telegram_id BIGINT UNIQUE NOT NULL,
                     username TEXT,
                     balance DOUBLE PRECISION DEFAULT 0.0,
+                    full_name TEXT,
+                    email TEXT,
+                    phone TEXT,
+                    country TEXT,
+                    status TEXT DEFAULT 'active',
+                    admin_notes TEXT,
+                    updated_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ DEFAULT now()
                 )
             """)
+            await ensure_postgres_crm_columns(conn)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS deposits (
                     id SERIAL PRIMARY KEY,
@@ -66,9 +104,17 @@ async def init_db():
                 telegram_id INTEGER UNIQUE NOT NULL,
                 username TEXT,
                 balance REAL DEFAULT 0.0,
+                full_name TEXT,
+                email TEXT,
+                phone TEXT,
+                country TEXT,
+                status TEXT DEFAULT 'active',
+                admin_notes TEXT,
+                updated_at TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        await ensure_sqlite_crm_columns(db)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS deposits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -350,5 +396,274 @@ async def list_users(limit: int = 20) -> list[dict]:
                LIMIT ?""",
             (limit,),
         )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_dashboard_stats() -> dict:
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM users) AS total_users,
+                    (SELECT COUNT(*) FROM deposits WHERE status = 'pending') AS pending_deposits,
+                    (SELECT COALESCE(SUM(balance), 0) FROM users) AS total_balance
+                """
+            )
+            return dict(row)
+        finally:
+            await conn.close()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM users) AS total_users,
+                (SELECT COUNT(*) FROM deposits WHERE status = 'pending') AS pending_deposits,
+                (SELECT COALESCE(SUM(balance), 0) FROM users) AS total_balance
+            """
+        )
+        row = await cursor.fetchone()
+        return dict(row)
+
+
+async def list_crm_users(
+    search: str | None = None, limit: int = 50, offset: int = 0
+) -> list[dict]:
+    search = (search or "").strip()
+
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            if search:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, telegram_id, username, balance, full_name, email, phone,
+                           country, status, created_at, updated_at
+                    FROM users
+                    WHERE CAST(telegram_id AS TEXT) ILIKE $1
+                       OR COALESCE(username, '') ILIKE $1
+                       OR COALESCE(full_name, '') ILIKE $1
+                       OR COALESCE(email, '') ILIKE $1
+                       OR COALESCE(phone, '') ILIKE $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    """,
+                    f"%{search}%",
+                    limit,
+                    offset,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, telegram_id, username, balance, full_name, email, phone,
+                           country, status, created_at, updated_at
+                    FROM users
+                    ORDER BY created_at DESC
+                    LIMIT $1 OFFSET $2
+                    """,
+                    limit,
+                    offset,
+                )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if search:
+            cursor = await db.execute(
+                """
+                SELECT id, telegram_id, username, balance, full_name, email, phone,
+                       country, status, created_at, updated_at
+                FROM users
+                WHERE CAST(telegram_id AS TEXT) LIKE ?
+                   OR COALESCE(username, '') LIKE ?
+                   OR COALESCE(full_name, '') LIKE ?
+                   OR COALESCE(email, '') LIKE ?
+                   OR COALESCE(phone, '') LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (f"%{search}%",) * 5 + (limit, offset),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT id, telegram_id, username, balance, full_name, email, phone,
+                       country, status, created_at, updated_at
+                FROM users
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_user_by_id(user_id: int) -> dict | None:
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+            return dict(row) if row else None
+        finally:
+            await conn.close()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def update_user_crm_fields(user_id: int, fields: dict):
+    allowed_fields = {
+        "full_name",
+        "email",
+        "phone",
+        "country",
+        "status",
+        "admin_notes",
+    }
+    clean_fields = {
+        key: (value.strip() if isinstance(value, str) else value)
+        for key, value in fields.items()
+        if key in allowed_fields
+    }
+
+    if not clean_fields:
+        return
+
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            assignments = []
+            values = []
+            for index, (key, value) in enumerate(clean_fields.items(), start=1):
+                assignments.append(f"{key} = ${index}")
+                values.append(value or None)
+            values.append(user_id)
+            await conn.execute(
+                f"""
+                UPDATE users
+                SET {', '.join(assignments)}, updated_at = now()
+                WHERE id = ${len(values)}
+                """,
+                *values,
+            )
+        finally:
+            await conn.close()
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        assignments = [f"{key} = ?" for key in clean_fields]
+        values = [value or None for value in clean_fields.values()]
+        values.append(user_id)
+        await db.execute(
+            f"""
+            UPDATE users
+            SET {', '.join(assignments)}, updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            values,
+        )
+        await db.commit()
+
+
+async def get_user_deposits_by_id(user_id: int, limit: int = 20) -> list[dict]:
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM deposits
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                user_id,
+                limit,
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT * FROM deposits
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def list_deposits(status: str | None = None, limit: int = 50) -> list[dict]:
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            if status:
+                rows = await conn.fetch(
+                    """
+                    SELECT d.*, u.telegram_id, u.username, u.full_name, u.email
+                    FROM deposits d
+                    JOIN users u ON d.user_id = u.id
+                    WHERE d.status = $1
+                    ORDER BY d.created_at DESC
+                    LIMIT $2
+                    """,
+                    status,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT d.*, u.telegram_id, u.username, u.full_name, u.email
+                    FROM deposits d
+                    JOIN users u ON d.user_id = u.id
+                    ORDER BY d.created_at DESC
+                    LIMIT $1
+                    """,
+                    limit,
+                )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if status:
+            cursor = await db.execute(
+                """
+                SELECT d.*, u.telegram_id, u.username, u.full_name, u.email
+                FROM deposits d
+                JOIN users u ON d.user_id = u.id
+                WHERE d.status = ?
+                ORDER BY d.created_at DESC
+                LIMIT ?
+                """,
+                (status, limit),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT d.*, u.telegram_id, u.username, u.full_name, u.email
+                FROM deposits d
+                JOIN users u ON d.user_id = u.id
+                ORDER BY d.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]

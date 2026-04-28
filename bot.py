@@ -9,6 +9,7 @@ from aiogram.enums import ParseMode
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
+from admin_web import setup_admin_routes
 from config import BOT_TOKEN, PORT, WEBHOOK_SECRET, WEBHOOK_URL
 from database import init_db
 from handlers import auth, signals, wallet, admin
@@ -55,6 +56,7 @@ async def main():
         app = web.Application()
         app.router.add_get("/", healthcheck)
         app.router.add_get("/health", healthcheck)
+        setup_admin_routes(app, bot)
 
         SimpleRequestHandler(
             dispatcher=dp,
@@ -77,6 +79,17 @@ async def main():
         logging.info("Bot webhook is running on port %s", PORT)
         await asyncio.Event().wait()
     else:
+        app = web.Application()
+        app.router.add_get("/", healthcheck)
+        app.router.add_get("/health", healthcheck)
+        setup_admin_routes(app, bot)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+
+        logging.info("Admin CRM is running on port %s", PORT)
         logging.info("Bot polling is starting...")
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)

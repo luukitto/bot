@@ -8,6 +8,9 @@ ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+ADMIN_WEB_USERNAME = os.getenv("ADMIN_WEB_USERNAME", "admin")
+ADMIN_WEB_PASSWORD = os.getenv("ADMIN_WEB_PASSWORD", "")
+ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", WEBHOOK_SECRET)
 PORT = int(os.getenv("PORT", "8000"))
 
 WALLET_ADDRESSES = {
