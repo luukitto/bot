@@ -1,3 +1,5 @@
+import secrets
+
 import aiosqlite
 
 try:
@@ -93,6 +95,58 @@ async def init_db():
                     created_at TIMESTAMPTZ DEFAULT now()
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_link_codes (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    code TEXT UNIQUE NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_activity (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    actor_type TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trading_accounts (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    cash_balance DOUBLE PRECISION DEFAULT 100000,
+                    status TEXT DEFAULT 'active',
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS paper_orders (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity DOUBLE PRECISION NOT NULL,
+                    order_type TEXT DEFAULT 'market',
+                    estimated_price DOUBLE PRECISION,
+                    status TEXT DEFAULT 'filled',
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS watchlists (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    symbol TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    UNIQUE (user_id, symbol)
+                )
+            """)
         finally:
             await conn.close()
         return
@@ -134,6 +188,63 @@ async def init_db():
                 symbol TEXT NOT NULL,
                 signal_data TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_link_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code TEXT UNIQUE NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                actor_type TEXT NOT NULL,
+                action TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trading_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                cash_balance REAL DEFAULT 100000,
+                status TEXT DEFAULT 'active',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                order_type TEXT DEFAULT 'market',
+                estimated_price REAL,
+                status TEXT DEFAULT 'filled',
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS watchlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE (user_id, symbol),
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
         """)
@@ -183,6 +294,89 @@ async def create_user(telegram_id: int, username: str | None) -> dict:
         )
         await db.commit()
     return await get_user(telegram_id)
+
+
+async def log_user_activity(
+    user_id: int | None,
+    actor_type: str,
+    action: str,
+    metadata: str = "{}",
+):
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            await conn.execute(
+                """
+                INSERT INTO user_activity (user_id, actor_type, action, metadata)
+                VALUES ($1, $2, $3, $4::jsonb)
+                """,
+                user_id,
+                actor_type,
+                action,
+                metadata,
+            )
+        finally:
+            await conn.close()
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_activity (user_id, actor_type, action, metadata)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, actor_type, action, metadata),
+        )
+        await db.commit()
+
+
+async def create_telegram_link_code(user_id: int, ttl_seconds: int = 600) -> str:
+    code = f"{secrets.randbelow(900000) + 100000}"
+
+    if use_postgres():
+        conn = await connect_postgres()
+        try:
+            await conn.execute(
+                """
+                UPDATE telegram_link_codes
+                SET used_at = now()
+                WHERE user_id = $1 AND used_at IS NULL
+                """,
+                user_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO telegram_link_codes (user_id, code, expires_at)
+                VALUES ($1, $2, now() + ($3 * interval '1 second'))
+                """,
+                user_id,
+                code,
+                ttl_seconds,
+            )
+        finally:
+            await conn.close()
+        await log_user_activity(user_id, "bot", "website_link_code_created")
+        return code
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE telegram_link_codes
+            SET used_at = datetime('now')
+            WHERE user_id = ? AND used_at IS NULL
+            """,
+            (user_id,),
+        )
+        await db.execute(
+            """
+            INSERT INTO telegram_link_codes (user_id, code, expires_at)
+            VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))
+            """,
+            (user_id, code, ttl_seconds),
+        )
+        await db.commit()
+    await log_user_activity(user_id, "bot", "website_link_code_created")
+    return code
 
 
 async def get_balance(telegram_id: int) -> float:

@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.env.example
+.env.local
+web/.env.local
+web/.env
